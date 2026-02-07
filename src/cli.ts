@@ -1,6 +1,9 @@
 #!/usr/bin/env node
+import "dotenv/config";
 
 import { execSync } from "node:child_process";
+import { groqProvider } from "./providers/groq.js";
+
 
 const MAX_CHARS = 25_000;
 
@@ -35,7 +38,9 @@ function sanitizeDiff(rawDiff: string): Sanitized {
   // This is NOT perfect security—just a guardrail.
   const secretPatterns: Array<{ name: string; re: RegExp }> = [
     { name: "private key block", re: /BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY/i },
-    { name: "API key assignment", re: /\bAPI[_-]?KEY\s*=/i },
+    // Match env-style secret assignments (e.g. GROQ_API_KEY=..., export API_KEY=...)
+    // and avoid false positives like `const apiKey = ...`.
+    { name: "API key assignment", re: /\b(?:export\s+)?[A-Z0-9_]*API[_-]?KEY[A-Z0-9_]*\s*=\s*\S+/ },
     { name: "password assignment", re: /\bPASS(?:WORD)?\s*=/i },
     { name: "secret assignment", re: /\bSECRET\s*=/i },
     { name: "token assignment", re: /\bTOKEN\s*=/i },
@@ -80,10 +85,7 @@ function sanitizeDiff(rawDiff: string): Sanitized {
   return { safeDiff, warnings };
 }
 
-function main() {
-  // Useful when debugging “why doesn't git see my repo”
-  // console.log("CWD:", process.cwd());
-
+async function main() {
   if (!isGitRepo()) {
     console.error("❌ Not a git repository. Run this inside a repo.");
     process.exit(1);
@@ -112,7 +114,20 @@ function main() {
   }
 
   console.log(`ℹ️ Using diff size: ${sanitized.safeDiff.length.toLocaleString()} chars\n`);
-  console.log(sanitized.safeDiff);
+
+  try {
+    const msg = await groqProvider.generateCommitMessage(sanitized.safeDiff);
+    console.log("✅ Suggested commit message:");
+    console.log(msg);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`❌ ${msg}`);
+    process.exit(1);
+  }
 }
 
-main();
+main().catch((e) => {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(`❌ ${msg}`);
+  process.exit(1);
+});
