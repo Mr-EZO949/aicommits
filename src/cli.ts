@@ -29,27 +29,47 @@ const MAX_CUSTOM_INSTRUCTIONS_CHARS = 1_000;
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
 type ParsedCommitMessage = { type: string; scope?: string; subject: string };
-type CliOptions = { showHelp: boolean; customInstructions?: string };
+type FilteringOptions = { includeLockfiles: boolean; excludeGlobs: string[] };
+type CliOptions = {
+  showHelp: boolean;
+  customInstructions?: string;
+  includeLockfiles: boolean;
+  excludeGlobs: string[];
+  debugPayload: boolean;
+};
 
 function printHelp(): void {
   console.log([
     "Usage:",
-    "  aicommits [--custom \"<preferences>\"] [--help]",
+    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--help]",
     "",
     "Options:",
     "  --custom <text>   Add optional commit style preferences (max 1000 chars).",
     "                    This is additive and never overrides safety/format rules.",
+    "  --include-lockfiles",
+    "                    Include lockfile diffs in AI input (default: excluded).",
+    "  --exclude <glob>  Exclude staged paths from AI input (repeatable).",
+    "                    Examples: --exclude \"dist/**\" --exclude \"*.map\"",
+    "  --debug-payload   Print exact payload text sent to the provider.",
     "  --help, -h        Show this help message.",
     "",
     "Examples:",
     "  aicommits",
     "  aicommits --custom \"prefer scope cli and mention tests when relevant\"",
     "  aicommits --custom \"focus on user-facing behavior changes\"",
+    "  aicommits --include-lockfiles",
+    "  aicommits --exclude \"dist/**\" --exclude \"*.map\"",
+    "  aicommits --debug-payload",
   ].join("\n"));
 }
 
 function parseCliOptions(argv: string[]): CliOptions {
-  const parsed: CliOptions = { showHelp: false };
+  const parsed: CliOptions = {
+    showHelp: false,
+    includeLockfiles: false,
+    excludeGlobs: [],
+    debugPayload: false,
+  };
   let sawCustom = false;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -63,12 +83,37 @@ function parseCliOptions(argv: string[]): CliOptions {
       continue;
     }
 
+    if (arg === "--include-lockfiles") {
+      parsed.includeLockfiles = true;
+      continue;
+    }
+
+    if (arg === "--debug-payload") {
+      parsed.debugPayload = true;
+      continue;
+    }
+
+    if (arg === "--exclude") {
+      const next = argv[i + 1];
+      if (!next || next === "--help" || next === "-h" || next.startsWith("--")) {
+        throw new Error("Missing value for `--exclude`. Example: --exclude \"dist/**\"");
+      }
+      parsed.excludeGlobs.push(next);
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--exclude=")) {
+      parsed.excludeGlobs.push(arg.slice("--exclude=".length));
+      continue;
+    }
+
     if (arg === "--custom") {
       if (sawCustom) {
         throw new Error("`--custom` can only be provided once.");
       }
       const next = argv[i + 1];
-      if (!next || next === "--help" || next === "-h" || next === "--custom" || next.startsWith("--custom=")) {
+      if (!next || next === "--help" || next === "-h" || next.startsWith("--")) {
         throw new Error("Missing value for `--custom`. Example: --custom \"prefer concise subjects\"");
       }
       parsed.customInstructions = next;
@@ -85,6 +130,11 @@ function parseCliOptions(argv: string[]): CliOptions {
       sawCustom = true;
       continue;
     }
+
+    if (arg.startsWith("-")) {
+      throw new Error(`Unknown option: ${arg}`);
+    }
+    throw new Error(`Unexpected argument: ${arg}`);
   }
 
   if (parsed.customInstructions !== undefined) {
@@ -98,6 +148,13 @@ function parseCliOptions(argv: string[]): CliOptions {
       );
     }
     parsed.customInstructions = custom;
+  }
+
+  parsed.excludeGlobs = parsed.excludeGlobs.map((glob) => glob.trim()).filter(Boolean);
+  for (const glob of parsed.excludeGlobs) {
+    if (glob.length > 512) {
+      throw new Error(`\`--exclude\` glob is too long (${glob.length} chars).`);
+    }
   }
 
   return parsed;
@@ -173,38 +230,111 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
+function globToRegExp(glob: string): RegExp {
+  const normalizedGlob = normalizePath(glob).replace(/^\.\/+/, "");
+  let pattern = "";
+
+  for (let i = 0; i < normalizedGlob.length; i += 1) {
+    const ch = normalizedGlob.charAt(i);
+    if (ch === "*") {
+      if (normalizedGlob.charAt(i + 1) === "*") {
+        pattern += ".*";
+        i += 1;
+      } else {
+        pattern += "[^/]*";
+      }
+      continue;
+    }
+    if (ch === "?") {
+      pattern += "[^/]";
+      continue;
+    }
+    pattern += ch.replace(/[-/\\^$+?.()|[\]{}]/g, "\\$&");
+  }
+
+  return new RegExp(`^${pattern}$`);
+}
+
+function matchesGlob(path: string, glob: string): boolean {
+  const normalizedPath = normalizePath(path);
+  const normalizedGlob = normalizePath(glob).replace(/^\.\/+/, "");
+  if (!normalizedGlob) {
+    return false;
+  }
+
+  const regex = globToRegExp(normalizedGlob);
+  if (normalizedGlob.includes("/")) {
+    return regex.test(normalizedPath);
+  }
+
+  const basename = normalizedPath.split("/").at(-1) ?? normalizedPath;
+  return regex.test(normalizedPath) || regex.test(basename);
+}
+
 function isLockfile(path: string): boolean {
   return LOCKFILES.has(normalizePath(path));
 }
 
-function isExcludedFromLLM(path: string): boolean {
+function getExclusionReason(path: string, options: FilteringOptions): string | null {
   const normalized = normalizePath(path);
 
+  const matchingGlob = options.excludeGlobs.find((glob) => matchesGlob(normalized, glob));
+  if (matchingGlob) {
+    return `matched --exclude ${matchingGlob}`;
+  }
+
   if (EXCLUDED_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
-    return true;
+    return "generated/build directory";
   }
 
   if (normalized === "node_modules" || normalized.includes("/node_modules/")) {
-    return true;
+    return "node_modules";
   }
 
   if (normalized.endsWith(".map")) {
-    return true;
+    return "*.map";
   }
 
   if (normalized.includes(".min.")) {
-    return true;
+    return "*.min.*";
   }
 
   if (normalized === ".env") {
-    return true;
+    return ".env";
   }
 
-  if (isLockfile(normalized)) {
-    return true;
+  if (!options.includeLockfiles && isLockfile(normalized)) {
+    return "lockfile";
   }
 
-  return false;
+  return null;
+}
+
+function isExcludedFromLLM(path: string, options: FilteringOptions): boolean {
+  return getExclusionReason(path, options) !== null;
+}
+
+function printAIInputSummary(stagedFiles: StagedFile[], options: FilteringOptions): void {
+  const included = stagedFiles.filter((file) => !isExcludedFromLLM(file.path, options));
+  const excluded = stagedFiles
+    .map((file) => ({ file, reason: getExclusionReason(file.path, options) }))
+    .filter((item): item is { file: StagedFile; reason: string } => item.reason !== null);
+
+  console.log(
+    `ℹ️ AI input summary: ${included.length} included, ${excluded.length} excluded, ${stagedFiles.length} staged total`
+  );
+
+  if (included.length > 0) {
+    const includedList = included.map((file) => `${file.status} ${file.path}`).join(", ");
+    console.log(`   included: ${includedList}`);
+  }
+
+  if (excluded.length > 0) {
+    const excludedList = excluded
+      .map((item) => `${item.file.status} ${item.file.path} (${item.reason})`)
+      .join(", ");
+    console.log(`   excluded: ${excludedList}`);
+  }
 }
 
 function assertNoSecrets(rawDiff: string): void {
@@ -267,7 +397,7 @@ function truncateForLLM(text: string): { text: string; warnings: string[] } {
   return { text: output, warnings };
 }
 
-function filterDiffByExcludedFiles(diffUnified0: string): string {
+function filterDiffByExcludedFiles(diffUnified0: string, options: FilteringOptions): string {
   if (!diffUnified0.trim()) {
     return "";
   }
@@ -291,7 +421,7 @@ function filterDiffByExcludedFiles(diffUnified0: string): string {
       currentChunk.push(line);
       const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
       const path = match?.[2] ?? match?.[1] ?? "";
-      keepCurrentChunk = path ? !isExcludedFromLLM(path) : true;
+      keepCurrentChunk = path ? !isExcludedFromLLM(path, options) : true;
       continue;
     }
     currentChunk.push(line);
@@ -301,12 +431,13 @@ function filterDiffByExcludedFiles(diffUnified0: string): string {
   return keptChunks.join("\n").trim();
 }
 
-function buildLLMPayload(stagedFiles: StagedFile[], diffUnified0: string): string {
+function buildLLMPayload(stagedFiles: StagedFile[], diffUnified0: string, options: FilteringOptions): string {
   const stagedLines = stagedFiles.map((file) => {
-    const excludedSuffix = isExcludedFromLLM(file.path) ? " (excluded)" : "";
+    const exclusionReason = getExclusionReason(file.path, options);
+    const excludedSuffix = exclusionReason ? ` (excluded: ${exclusionReason})` : "";
     return `${file.status} ${file.path}${excludedSuffix}`;
   });
-  const filteredDiff = filterDiffByExcludedFiles(diffUnified0);
+  const filteredDiff = filterDiffByExcludedFiles(diffUnified0, options);
 
   return [
     "STAGED FILES:",
@@ -430,6 +561,12 @@ function buildRetryPayload(basePayload: string, firstOutput: string, reason: str
   ].join("\n");
 }
 
+function printDebugPayload(payload: string, label: string): void {
+  console.log(`\n🔎 DEBUG PAYLOAD (${label}) START`);
+  console.log(payload);
+  console.log(`🔎 DEBUG PAYLOAD (${label}) END\n`);
+}
+
 type CommitAction = "yes" | "no" | "regenerate";
 
 async function promptForCommitAction(message: string, allowRegenerate: boolean): Promise<CommitAction> {
@@ -517,14 +654,24 @@ function getDeterministicAlternativeMessage(previousMessage: string): string {
   return SAFE_FALLBACK_MESSAGE;
 }
 
-async function generateValidatedMessage(payload: string, customInstructions?: string): Promise<string> {
+async function generateValidatedMessage(
+  payload: string,
+  customInstructions?: string,
+  debugPayload = false
+): Promise<string> {
   const providerOptions = customInstructions ? { customInstructions } : undefined;
+  if (debugPayload) {
+    printDebugPayload(payload, "provider:first-attempt");
+  }
   const firstAttempt = await groqProvider.generateCommitMessage(payload, providerOptions);
   const firstValidation = validateCommitMessage(firstAttempt);
 
   let msg = firstAttempt.trim();
   if (!firstValidation.valid) {
     const retryPayload = buildRetryPayload(payload, firstAttempt, firstValidation.reason);
+    if (debugPayload) {
+      printDebugPayload(retryPayload, "provider:format-retry");
+    }
     const secondAttempt = await groqProvider.generateCommitMessage(retryPayload, providerOptions);
     const secondValidation = validateCommitMessage(secondAttempt);
 
@@ -550,7 +697,8 @@ async function generateDistinctRegeneratedMessage(
   basePayload: string,
   previousMessage: string,
   regenerationNumber: number,
-  customInstructions?: string
+  customInstructions?: string,
+  debugPayload = false
 ): Promise<string> {
   const previous = previousMessage.trim();
   const previousParsed = parseCommitMessage(previous);
@@ -573,7 +721,7 @@ async function generateDistinctRegeneratedMessage(
       .filter(Boolean)
       .join("\n");
 
-    const candidate = await generateValidatedMessage(regenerationPayload, customInstructions);
+    const candidate = await generateValidatedMessage(regenerationPayload, customInstructions, debugPayload);
     const candidateTrimmed = candidate.trim();
     const candidateParsed = parseCommitMessage(candidateTrimmed);
     const hasDifferentSubject = previousParsed && candidateParsed
@@ -619,6 +767,11 @@ async function main() {
       process.exit(1);
     }
   }
+  const filteringOptions: FilteringOptions = {
+    includeLockfiles: cliOptions.includeLockfiles,
+    excludeGlobs: cliOptions.excludeGlobs,
+  };
+  const debugPayload = cliOptions.debugPayload;
 
   if (!isGitRepo()) {
     console.error("❌ Not a git repository. Run this inside a repo.");
@@ -647,7 +800,9 @@ async function main() {
     process.exit(1);
   }
 
-  const includedFiles = stagedFiles.filter((f) => !isExcludedFromLLM(f.path));
+  printAIInputSummary(stagedFiles, filteringOptions);
+
+  const includedFiles = stagedFiles.filter((f) => !isExcludedFromLLM(f.path, filteringOptions));
   const hasLockfile = stagedFiles.some((f) => isLockfile(f.path));
   let finalMessage = "";
   let truncatedPayload = "";
@@ -656,7 +811,7 @@ async function main() {
   if (includedFiles.length === 0 && hasLockfile) {
     finalMessage = "chore(deps): update lockfile";
   } else {
-    const basePayload = buildLLMPayload(stagedFiles, rawDiffUnified0);
+    const basePayload = buildLLMPayload(stagedFiles, rawDiffUnified0, filteringOptions);
     const truncation = truncateForLLM(basePayload);
     const warnings = [...collectNoiseWarnings(rawDiffUnified0), ...truncation.warnings];
     truncatedPayload = truncation.text;
@@ -669,7 +824,7 @@ async function main() {
     console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
 
     try {
-      finalMessage = await generateValidatedMessage(truncatedPayload, customInstructions);
+      finalMessage = await generateValidatedMessage(truncatedPayload, customInstructions, debugPayload);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
@@ -693,7 +848,8 @@ async function main() {
           truncatedPayload,
           finalMessage,
           regenerations,
-          customInstructions
+          customInstructions,
+          debugPayload
         );
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
