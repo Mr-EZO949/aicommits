@@ -25,6 +25,7 @@ const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
 const MAX_REGENERATIONS = 3;
 const MAX_REGENERATION_PROVIDER_ATTEMPTS = 3;
 const MAX_CUSTOM_INSTRUCTIONS_CHARS = 1_000;
+const STYLE_HISTORY_LIMIT = 20;
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
@@ -158,6 +159,123 @@ function parseCliOptions(argv: string[]): CliOptions {
   }
 
   return parsed;
+}
+
+function getRecentCommitSubjects(limit = STYLE_HISTORY_LIMIT): string[] {
+  try {
+    const raw = run(`git log -n ${limit} --pretty=%s`);
+    return raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    // Best-effort only (e.g., brand new repo with no commits).
+    return [];
+  }
+}
+
+function getMostFrequent(counts: Map<string, number>): { value: string; count: number } | null {
+  let bestValue = "";
+  let bestCount = 0;
+  for (const [value, count] of counts.entries()) {
+    if (count > bestCount) {
+      bestValue = value;
+      bestCount = count;
+    }
+  }
+  if (!bestValue) {
+    return null;
+  }
+  return { value: bestValue, count: bestCount };
+}
+
+function getLetterCase(text: string): "lower" | "upper" | "none" {
+  const firstLetter = text.match(/[A-Za-z]/)?.[0] ?? "";
+  if (!firstLetter) {
+    return "none";
+  }
+  return firstLetter === firstLetter.toLowerCase() ? "lower" : "upper";
+}
+
+function inferRepoStyleInstructions(subjects: string[]): string | undefined {
+  if (subjects.length === 0) {
+    return undefined;
+  }
+
+  const typeCounts = new Map<string, number>();
+  const scopeCounts = new Map<string, number>();
+  let parsedCount = 0;
+  let lowerCaseSubjects = 0;
+  let upperCaseSubjects = 0;
+  let ticketPrefixCount = 0;
+  let ticketPrefixSample = "";
+
+  for (const subject of subjects) {
+    const parsed = parseCommitMessage(subject);
+    const subjectText = parsed?.subject ?? subject;
+    const letterCase = getLetterCase(subjectText);
+    if (letterCase === "lower") {
+      lowerCaseSubjects += 1;
+    } else if (letterCase === "upper") {
+      upperCaseSubjects += 1;
+    }
+
+    const ticketMatch = subjectText.match(/^(?:\[[A-Z]+-\d+\]|[A-Z]+-\d+)[:\s-]?/);
+    if (ticketMatch) {
+      ticketPrefixCount += 1;
+      if (!ticketPrefixSample) {
+        ticketPrefixSample = ticketMatch[0].trim();
+      }
+    }
+
+    if (!parsed) {
+      continue;
+    }
+    parsedCount += 1;
+    typeCounts.set(parsed.type, (typeCounts.get(parsed.type) ?? 0) + 1);
+    if (parsed.scope) {
+      scopeCounts.set(parsed.scope, (scopeCounts.get(parsed.scope) ?? 0) + 1);
+    }
+  }
+
+  const hints: string[] = [];
+  const dominantType = getMostFrequent(typeCounts);
+  if (dominantType && parsedCount > 0 && dominantType.count / parsedCount >= 0.35) {
+    hints.push(`Prefer type \`${dominantType.value}\` when it accurately matches the staged change.`);
+  }
+
+  const dominantScope = getMostFrequent(scopeCounts);
+  if (dominantScope && parsedCount > 0 && dominantScope.count / parsedCount >= 0.25) {
+    hints.push(`Preferred scope is often \`${dominantScope.value}\`; use it when relevant.`);
+  }
+
+  if (subjects.length > 0 && lowerCaseSubjects / subjects.length >= 0.7) {
+    hints.push("Start subject text with lowercase (repo convention).");
+  } else if (subjects.length > 0 && upperCaseSubjects / subjects.length >= 0.7) {
+    hints.push("Start subject text with uppercase (repo convention).");
+  }
+
+  if (subjects.length > 0 && ticketPrefixCount / subjects.length >= 0.25) {
+    const sample = ticketPrefixSample || "ABC-123";
+    hints.push(`When applicable, keep ticket-prefix style in subject (e.g. \`${sample}\`).`);
+  }
+
+  if (hints.length === 0) {
+    return undefined;
+  }
+
+  return [
+    `Repository style hints inferred from last ${subjects.length} commit subjects:`,
+    ...hints.map((hint) => `- ${hint}`),
+  ].join("\n");
+}
+
+function buildEffectiveCustomInstructions(userCustomInstructions?: string): string | undefined {
+  const styleInstructions = inferRepoStyleInstructions(getRecentCommitSubjects());
+  if (styleInstructions && userCustomInstructions) {
+    return `${styleInstructions}\n\nUser preferences:\n${userCustomInstructions}`;
+  }
+  return styleInstructions || userCustomInstructions;
 }
 
 // Runs a shell command and returns stdout as a string.
@@ -757,16 +875,23 @@ async function main() {
     process.exit(0);
   }
 
-  const customInstructions = cliOptions.customInstructions;
-  if (customInstructions) {
+  const userCustomInstructions = cliOptions.customInstructions;
+  if (userCustomInstructions) {
     try {
-      assertNoSecrets(customInstructions);
+      assertNoSecrets(userCustomInstructions);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
       process.exit(1);
     }
   }
+  const effectiveCustomInstructions = buildEffectiveCustomInstructions(userCustomInstructions);
+  if (effectiveCustomInstructions && !userCustomInstructions) {
+    console.log("ℹ️ Applying inferred repository commit style from recent history.");
+  } else if (effectiveCustomInstructions && userCustomInstructions) {
+    console.log("ℹ️ Applying inferred repository style + your custom instructions.");
+  }
+
   const filteringOptions: FilteringOptions = {
     includeLockfiles: cliOptions.includeLockfiles,
     excludeGlobs: cliOptions.excludeGlobs,
@@ -824,7 +949,7 @@ async function main() {
     console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
 
     try {
-      finalMessage = await generateValidatedMessage(truncatedPayload, customInstructions, debugPayload);
+      finalMessage = await generateValidatedMessage(truncatedPayload, effectiveCustomInstructions, debugPayload);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
@@ -848,7 +973,7 @@ async function main() {
           truncatedPayload,
           finalMessage,
           regenerations,
-          customInstructions,
+          effectiveCustomInstructions,
           debugPayload
         );
       } catch (e) {

@@ -84,7 +84,7 @@ export const groqProvider: Provider = {
             : "",
           "",
           "INPUT:",
-          diff, // this is your M3.5 payload string
+          diff, 
         ].join("\n"),
       },
     ];
