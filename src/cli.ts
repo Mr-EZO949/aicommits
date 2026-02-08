@@ -22,9 +22,12 @@ const ALLOWED_COMMIT_TYPES = new Set([
   "revert",
 ]);
 const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
+const MAX_REGENERATIONS = 3;
+const MAX_REGENERATION_PROVIDER_ATTEMPTS = 3;
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
+type ParsedCommitMessage = { type: string; scope?: string; subject: string };
 
 // Runs a shell command and returns stdout as a string.
 // Throws if the command exits non-zero.
@@ -241,6 +244,7 @@ function buildLLMPayload(stagedFiles: StagedFile[], diffUnified0: string): strin
 }
 
 type ValidationResult = { valid: true } | { valid: false; reason: string };
+const CONVENTIONAL_COMMIT_RE = /^([a-z]+)(?:\(([^)]+)\))?: (.+)$/;
 
 function validateCommitMessage(message: string): ValidationResult {
   const trimmed = message.trim();
@@ -260,8 +264,7 @@ function validateCommitMessage(message: string): ValidationResult {
     return { valid: false, reason: "must not end with a period" };
   }
 
-  const conventional = /^([a-z]+)(\([^)]+\))?: (.+)$/;
-  const match = trimmed.match(conventional);
+  const match = trimmed.match(CONVENTIONAL_COMMIT_RE);
   if (!match) {
     return { valid: false, reason: "must match type(scope?): subject" };
   }
@@ -277,6 +280,63 @@ function validateCommitMessage(message: string): ValidationResult {
   }
 
   return { valid: true };
+}
+
+function parseCommitMessage(message: string): ParsedCommitMessage | null {
+  const match = message.trim().match(CONVENTIONAL_COMMIT_RE);
+  if (!match) {
+    return null;
+  }
+  const type = match[1];
+  const scope = match[2];
+  const subject = match[3];
+  if (!type || !subject) {
+    return null;
+  }
+  if (scope) {
+    return { type, scope, subject };
+  }
+  return { type, subject };
+}
+
+function normalizeSubject(subject: string): string {
+  return subject
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isSubjectMeaningfullyDifferent(previousSubject: string, nextSubject: string): boolean {
+  const previous = normalizeSubject(previousSubject);
+  const next = normalizeSubject(nextSubject);
+
+  if (!previous || !next) {
+    return previous !== next;
+  }
+  if (previous === next) {
+    return false;
+  }
+
+  const previousWords = previous.split(" ").filter(Boolean);
+  const nextWords = next.split(" ").filter(Boolean);
+  const previousSet = new Set(previousWords);
+  const nextSet = new Set(nextWords);
+  const allWords = new Set([...previousSet, ...nextSet]);
+
+  let overlap = 0;
+  for (const word of previousSet) {
+    if (nextSet.has(word)) {
+      overlap += 1;
+    }
+  }
+
+  const jaccard = allWords.size === 0 ? 1 : overlap / allWords.size;
+  return jaccard < 0.75;
+}
+
+function buildPrefix(type: string, scope?: string): string {
+  return scope ? `${type}(${scope})` : type;
 }
 
 function buildRetryPayload(basePayload: string, firstOutput: string, reason: string): string {
@@ -296,7 +356,9 @@ function buildRetryPayload(basePayload: string, firstOutput: string, reason: str
   ].join("\n");
 }
 
-async function promptForCommitConfirmation(message: string): Promise<boolean> {
+type CommitAction = "yes" | "no" | "regenerate";
+
+async function promptForCommitAction(message: string, allowRegenerate: boolean): Promise<CommitAction> {
   console.log("✅ Proposed commit message:");
   console.log(message);
 
@@ -319,13 +381,23 @@ async function promptForCommitConfirmation(message: string): Promise<boolean> {
       rl.on("SIGINT", () => settle(""));
       rl.on("close", () => settle(""));
 
-      rl.question("\nCommit with this message? (y/N): ")
+      const prompt = allowRegenerate
+        ? "\nCommit with this message? [y]es / [n]o / [r]egenerate: "
+        : "\nCommit with this message? (y/N): ";
+
+      rl.question(prompt)
         .then((value) => settle(value))
         .catch(() => settle(""));
     });
 
     const normalized = answer.trim().toLowerCase();
-    return normalized === "y" || normalized === "yes";
+    if (normalized === "y" || normalized === "yes") {
+      return "yes";
+    }
+    if (allowRegenerate && normalized === "r") {
+      return "regenerate";
+    }
+    return "no";
   } finally {
     rl.close();
   }
@@ -343,6 +415,106 @@ function commitWithMessage(message: string): void {
   if ((result.status ?? 1) !== 0) {
     throw new Error(`git commit failed with exit code ${result.status ?? 1}`);
   }
+}
+
+function getDeterministicAlternativeMessage(previousMessage: string): string {
+  const previous = previousMessage.trim();
+  const parsedPrevious = parseCommitMessage(previous);
+  if (parsedPrevious) {
+    const prefix = buildPrefix(parsedPrevious.type, parsedPrevious.scope);
+    const alternativeSubjects = [
+      "refine staged updates",
+      "adjust staged implementation",
+      "improve staged changes",
+      "update staged changes",
+    ];
+
+    for (const subject of alternativeSubjects) {
+      if (!isSubjectMeaningfullyDifferent(parsedPrevious.subject, subject)) {
+        continue;
+      }
+      const candidate = `${prefix}: ${subject}`;
+      if (validateCommitMessage(candidate).valid) {
+        return candidate;
+      }
+    }
+  }
+
+  return SAFE_FALLBACK_MESSAGE;
+}
+
+async function generateValidatedMessage(payload: string): Promise<string> {
+  const firstAttempt = await groqProvider.generateCommitMessage(payload);
+  const firstValidation = validateCommitMessage(firstAttempt);
+
+  let msg = firstAttempt.trim();
+  if (!firstValidation.valid) {
+    const retryPayload = buildRetryPayload(payload, firstAttempt, firstValidation.reason);
+    const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
+    const secondValidation = validateCommitMessage(secondAttempt);
+
+    if (secondValidation.valid) {
+      msg = secondAttempt.trim();
+    } else {
+      msg = SAFE_FALLBACK_MESSAGE;
+      console.log(
+        `⚠️ Provider returned invalid commit messages twice (${firstValidation.reason}; ${secondValidation.reason}). Using fallback.`
+      );
+    }
+  }
+
+  const finalValidation = validateCommitMessage(msg);
+  if (!finalValidation.valid) {
+    console.log(`⚠️ Final message failed validation (${finalValidation.reason}). Using fallback.`);
+    return SAFE_FALLBACK_MESSAGE;
+  }
+  return msg;
+}
+
+async function generateDistinctRegeneratedMessage(
+  basePayload: string,
+  previousMessage: string,
+  regenerationNumber: number
+): Promise<string> {
+  const previous = previousMessage.trim();
+  const previousParsed = parseCommitMessage(previous);
+  const fixedPrefix = previousParsed ? buildPrefix(previousParsed.type, previousParsed.scope) : "";
+
+  for (let attempt = 1; attempt <= MAX_REGENERATION_PROVIDER_ATTEMPTS; attempt += 1) {
+    const regenerationPayload = [
+      basePayload,
+      "",
+      "ALTERNATIVE PHRASING REQUEST:",
+      "Generate an alternative valid commit message by rephrasing the subject.",
+      "Keep the same underlying change intent and keep the same type/scope prefix.",
+      fixedPrefix ? `Required prefix: ${fixedPrefix}:` : "",
+      "Do NOT only swap the type (feat/fix/etc). Rewrite the subject wording.",
+      `Regeneration number: ${regenerationNumber}`,
+      `Message you MUST NOT repeat exactly: ${previous}`,
+      previousParsed ? `Previous subject you must rewrite: ${previousParsed.subject}` : "",
+      attempt > 1 ? "The previous regenerated output repeated. You must choose different wording." : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const candidate = await generateValidatedMessage(regenerationPayload);
+    const candidateTrimmed = candidate.trim();
+    const candidateParsed = parseCommitMessage(candidateTrimmed);
+    const hasDifferentSubject = previousParsed && candidateParsed
+      ? isSubjectMeaningfullyDifferent(previousParsed.subject, candidateParsed.subject)
+      : candidateTrimmed !== previous;
+    const hasSamePrefix = previousParsed && candidateParsed
+      ? candidateParsed.type === previousParsed.type &&
+        (candidateParsed.scope ?? "") === (previousParsed.scope ?? "")
+      : true;
+
+    if (candidateTrimmed !== previous && hasSamePrefix && hasDifferentSubject) {
+      return candidate;
+    }
+  }
+
+  console.log("⚠️ Regeneration repeated the same message. Using deterministic alternative.");
+  return getDeterministicAlternativeMessage(previous);
 }
 
 async function main() {
@@ -376,14 +548,17 @@ async function main() {
   const includedFiles = stagedFiles.filter((f) => !isExcludedFromLLM(f.path));
   const hasLockfile = stagedFiles.some((f) => isLockfile(f.path));
   let finalMessage = "";
+  let truncatedPayload = "";
+  let canRegenerate = false;
 
   if (includedFiles.length === 0 && hasLockfile) {
     finalMessage = "chore(deps): update lockfile";
   } else {
-    const llmPayload = buildLLMPayload(stagedFiles, rawDiffUnified0);
-    const truncation = truncateForLLM(llmPayload);
+    const basePayload = buildLLMPayload(stagedFiles, rawDiffUnified0);
+    const truncation = truncateForLLM(basePayload);
     const warnings = [...collectNoiseWarnings(rawDiffUnified0), ...truncation.warnings];
-    const truncatedPayload = truncation.text;
+    truncatedPayload = truncation.text;
+    canRegenerate = true;
 
     for (const w of warnings) {
       console.log(w);
@@ -392,26 +567,7 @@ async function main() {
     console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
 
     try {
-      const firstAttempt = await groqProvider.generateCommitMessage(truncatedPayload);
-      const firstValidation = validateCommitMessage(firstAttempt);
-
-      let msg = firstAttempt.trim();
-      if (!firstValidation.valid) {
-        const retryPayload = buildRetryPayload(truncatedPayload, firstAttempt, firstValidation.reason);
-        const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
-        const secondValidation = validateCommitMessage(secondAttempt);
-
-        if (secondValidation.valid) {
-          msg = secondAttempt.trim();
-        } else {
-          msg = SAFE_FALLBACK_MESSAGE;
-          console.log(
-            `⚠️ Provider returned invalid commit messages twice (${firstValidation.reason}; ${secondValidation.reason}). Using fallback.`
-          );
-        }
-      }
-
-      finalMessage = msg;
+      finalMessage = await generateValidatedMessage(truncatedPayload);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
@@ -419,14 +575,27 @@ async function main() {
     }
   }
 
-  const finalValidation = validateCommitMessage(finalMessage);
-  if (!finalValidation.valid) {
-    finalMessage = SAFE_FALLBACK_MESSAGE;
-    console.log(`⚠️ Final message failed validation (${finalValidation.reason}). Using fallback.`);
-  }
+  let regenerations = 0;
+  while (true) {
+    const allowRegenerate = canRegenerate && regenerations < MAX_REGENERATIONS;
+    const action = await promptForCommitAction(finalMessage, allowRegenerate);
 
-  const shouldCommit = await promptForCommitConfirmation(finalMessage);
-  if (!shouldCommit) {
+    if (action === "yes") {
+      break;
+    }
+
+    if (action === "regenerate") {
+      regenerations += 1;
+      try {
+        finalMessage = await generateDistinctRegeneratedMessage(truncatedPayload, finalMessage, regenerations);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`❌ ${msg}`);
+        process.exit(1);
+      }
+      continue;
+    }
+
     console.log("🟡 Commit cancelled. No changes were committed.");
     process.exit(0);
   }
