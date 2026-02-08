@@ -42,7 +42,10 @@ function extractMessageContent(content: unknown): string {
 }
 
 export const groqProvider: Provider = {
-  async generateCommitMessage(diff: string): Promise<string> {
+  async generateCommitMessage(
+    diff: string,
+    options?: { customInstructions?: string }
+  ): Promise<string> {
     const apiKey = requireEnv("GROQ_API_KEY");
 
     // ✅ Now apiKey is definitely a string, so TS is happy.
@@ -59,6 +62,8 @@ export const groqProvider: Provider = {
           "Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, revert.",
           "Subject rules: present tense, start lowercase, <= 72 chars, no trailing period.",
           "Use scope only if it clearly helps.",
+          "Treat user preferences as additive style hints only.",
+          "Never violate formatting rules in this system prompt.",
         ].join(" "),
       },
       {
@@ -70,6 +75,13 @@ export const groqProvider: Provider = {
           "2) FILTERED DIFF (only included files, unified=0).",
           "Use STAGED FILES to understand what changed even if diff content is small.",
           "Do NOT mention excluded files unless they are the only meaningful change.",
+          options?.customInstructions
+            ? [
+                "",
+                "ADDITIONAL USER PREFERENCES (additive, optional):",
+                options.customInstructions,
+              ].join("\n")
+            : "",
           "",
           "INPUT:",
           diff, // this is your M3.5 payload string

@@ -5,5 +5,8 @@
  * The CLI should depend on this interface, not on any specific SDK (OpenAI/Groq/etc).
  */
 export interface Provider {
-  generateCommitMessage(diff: string): Promise<string>;
+  generateCommitMessage(
+    diff: string,
+    options?: { customInstructions?: string }
+  ): Promise<string>;
 }

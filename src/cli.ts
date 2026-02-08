@@ -24,10 +24,84 @@ const ALLOWED_COMMIT_TYPES = new Set([
 const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
 const MAX_REGENERATIONS = 3;
 const MAX_REGENERATION_PROVIDER_ATTEMPTS = 3;
+const MAX_CUSTOM_INSTRUCTIONS_CHARS = 1_000;
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
 type ParsedCommitMessage = { type: string; scope?: string; subject: string };
+type CliOptions = { showHelp: boolean; customInstructions?: string };
+
+function printHelp(): void {
+  console.log([
+    "Usage:",
+    "  aicommits [--custom \"<preferences>\"] [--help]",
+    "",
+    "Options:",
+    "  --custom <text>   Add optional commit style preferences (max 1000 chars).",
+    "                    This is additive and never overrides safety/format rules.",
+    "  --help, -h        Show this help message.",
+    "",
+    "Examples:",
+    "  aicommits",
+    "  aicommits --custom \"prefer scope cli and mention tests when relevant\"",
+    "  aicommits --custom \"focus on user-facing behavior changes\"",
+  ].join("\n"));
+}
+
+function parseCliOptions(argv: string[]): CliOptions {
+  const parsed: CliOptions = { showHelp: false };
+  let sawCustom = false;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--help" || arg === "-h") {
+      parsed.showHelp = true;
+      continue;
+    }
+
+    if (arg === "--custom") {
+      if (sawCustom) {
+        throw new Error("`--custom` can only be provided once.");
+      }
+      const next = argv[i + 1];
+      if (!next || next === "--help" || next === "-h" || next === "--custom" || next.startsWith("--custom=")) {
+        throw new Error("Missing value for `--custom`. Example: --custom \"prefer concise subjects\"");
+      }
+      parsed.customInstructions = next;
+      sawCustom = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--custom=")) {
+      if (sawCustom) {
+        throw new Error("`--custom` can only be provided once.");
+      }
+      parsed.customInstructions = arg.slice("--custom=".length);
+      sawCustom = true;
+      continue;
+    }
+  }
+
+  if (parsed.customInstructions !== undefined) {
+    const custom = parsed.customInstructions.trim();
+    if (custom.length === 0) {
+      throw new Error("`--custom` value cannot be empty.");
+    }
+    if (custom.length > MAX_CUSTOM_INSTRUCTIONS_CHARS) {
+      throw new Error(
+        `\`--custom\` is too long (${custom.length} chars). Max is ${MAX_CUSTOM_INSTRUCTIONS_CHARS} chars.`
+      );
+    }
+    parsed.customInstructions = custom;
+  }
+
+  return parsed;
+}
 
 // Runs a shell command and returns stdout as a string.
 // Throws if the command exits non-zero.
@@ -443,14 +517,15 @@ function getDeterministicAlternativeMessage(previousMessage: string): string {
   return SAFE_FALLBACK_MESSAGE;
 }
 
-async function generateValidatedMessage(payload: string): Promise<string> {
-  const firstAttempt = await groqProvider.generateCommitMessage(payload);
+async function generateValidatedMessage(payload: string, customInstructions?: string): Promise<string> {
+  const providerOptions = customInstructions ? { customInstructions } : undefined;
+  const firstAttempt = await groqProvider.generateCommitMessage(payload, providerOptions);
   const firstValidation = validateCommitMessage(firstAttempt);
 
   let msg = firstAttempt.trim();
   if (!firstValidation.valid) {
     const retryPayload = buildRetryPayload(payload, firstAttempt, firstValidation.reason);
-    const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
+    const secondAttempt = await groqProvider.generateCommitMessage(retryPayload, providerOptions);
     const secondValidation = validateCommitMessage(secondAttempt);
 
     if (secondValidation.valid) {
@@ -474,7 +549,8 @@ async function generateValidatedMessage(payload: string): Promise<string> {
 async function generateDistinctRegeneratedMessage(
   basePayload: string,
   previousMessage: string,
-  regenerationNumber: number
+  regenerationNumber: number,
+  customInstructions?: string
 ): Promise<string> {
   const previous = previousMessage.trim();
   const previousParsed = parseCommitMessage(previous);
@@ -497,7 +573,7 @@ async function generateDistinctRegeneratedMessage(
       .filter(Boolean)
       .join("\n");
 
-    const candidate = await generateValidatedMessage(regenerationPayload);
+    const candidate = await generateValidatedMessage(regenerationPayload, customInstructions);
     const candidateTrimmed = candidate.trim();
     const candidateParsed = parseCommitMessage(candidateTrimmed);
     const hasDifferentSubject = previousParsed && candidateParsed
@@ -518,6 +594,32 @@ async function generateDistinctRegeneratedMessage(
 }
 
 async function main() {
+  let cliOptions: CliOptions;
+  try {
+    cliOptions = parseCliOptions(process.argv.slice(2));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`❌ ${msg}`);
+    console.error("Run `aicommits --help` for usage.");
+    process.exit(1);
+  }
+
+  if (cliOptions.showHelp) {
+    printHelp();
+    process.exit(0);
+  }
+
+  const customInstructions = cliOptions.customInstructions;
+  if (customInstructions) {
+    try {
+      assertNoSecrets(customInstructions);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`❌ ${msg}`);
+      process.exit(1);
+    }
+  }
+
   if (!isGitRepo()) {
     console.error("❌ Not a git repository. Run this inside a repo.");
     process.exit(1);
@@ -567,7 +669,7 @@ async function main() {
     console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
 
     try {
-      finalMessage = await generateValidatedMessage(truncatedPayload);
+      finalMessage = await generateValidatedMessage(truncatedPayload, customInstructions);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
@@ -587,7 +689,12 @@ async function main() {
     if (action === "regenerate") {
       regenerations += 1;
       try {
-        finalMessage = await generateDistinctRegeneratedMessage(truncatedPayload, finalMessage, regenerations);
+        finalMessage = await generateDistinctRegeneratedMessage(
+          truncatedPayload,
+          finalMessage,
+          regenerations,
+          customInstructions
+        );
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error(`❌ ${msg}`);
