@@ -8,6 +8,19 @@ import { groqProvider } from "./providers/groq.js";
 const MAX_CHARS = 25_000;
 const LOCKFILES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]);
 const EXCLUDED_PREFIXES = ["dist/", "build/", "coverage/", "node_modules/"];
+const ALLOWED_COMMIT_TYPES = new Set([
+  "feat",
+  "fix",
+  "docs",
+  "refactor",
+  "perf",
+  "test",
+  "build",
+  "ci",
+  "chore",
+  "revert",
+]);
+const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
@@ -226,6 +239,62 @@ function buildLLMPayload(stagedFiles: StagedFile[], diffUnified0: string): strin
   ].join("\n");
 }
 
+type ValidationResult = { valid: true } | { valid: false; reason: string };
+
+function validateCommitMessage(message: string): ValidationResult {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return { valid: false, reason: "empty message" };
+  }
+
+  if (trimmed.includes("\n") || trimmed.includes("\r")) {
+    return { valid: false, reason: "must be a single line" };
+  }
+
+  if (trimmed.length > 72) {
+    return { valid: false, reason: "must be <= 72 chars" };
+  }
+
+  if (trimmed.endsWith(".")) {
+    return { valid: false, reason: "must not end with a period" };
+  }
+
+  const conventional = /^([a-z]+)(\([^)]+\))?: (.+)$/;
+  const match = trimmed.match(conventional);
+  if (!match) {
+    return { valid: false, reason: "must match type(scope?): subject" };
+  }
+
+  const type = match[1];
+  const subject = match[3];
+  if (!type || !ALLOWED_COMMIT_TYPES.has(type)) {
+    return { valid: false, reason: "type must be allowed lowercase conventional type" };
+  }
+
+  if (!subject || !subject.trim()) {
+    return { valid: false, reason: "subject must be present" };
+  }
+
+  return { valid: true };
+}
+
+function buildRetryPayload(basePayload: string, firstOutput: string, reason: string): string {
+  return [
+    basePayload,
+    "",
+    "FORMAT FIX REQUEST:",
+    "Your previous output was invalid. Return ONLY one corrected commit message line.",
+    "Strict rules:",
+    "1) Must match: type(scope?): subject",
+    "2) Allowed lowercase types: feat, fix, docs, refactor, perf, test, build, ci, chore, revert",
+    "3) Max 72 characters total",
+    "4) No trailing period",
+    "5) No quotes, markdown, bullets, or extra text",
+    `Invalid output: ${firstOutput.replace(/\s+/g, " ").trim() || "(empty)"}`,
+    `Reason: ${reason}`,
+  ].join("\n");
+}
+
 async function main() {
   if (!isGitRepo()) {
     console.error("❌ Not a git repository. Run this inside a repo.");
@@ -274,7 +343,25 @@ async function main() {
   console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
 
   try {
-    const msg = await groqProvider.generateCommitMessage(truncatedPayload);
+    const firstAttempt = await groqProvider.generateCommitMessage(truncatedPayload);
+    const firstValidation = validateCommitMessage(firstAttempt);
+
+    let msg = firstAttempt.trim();
+    if (!firstValidation.valid) {
+      const retryPayload = buildRetryPayload(truncatedPayload, firstAttempt, firstValidation.reason);
+      const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
+      const secondValidation = validateCommitMessage(secondAttempt);
+
+      if (secondValidation.valid) {
+        msg = secondAttempt.trim();
+      } else {
+        msg = SAFE_FALLBACK_MESSAGE;
+        console.log(
+          `⚠️ Provider returned invalid commit messages twice (${firstValidation.reason}; ${secondValidation.reason}). Using fallback.`
+        );
+      }
+    }
+
     console.log("✅ Suggested commit message:");
     console.log(msg);
   } catch (e) {
