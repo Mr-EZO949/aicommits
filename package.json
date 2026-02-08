@@ -1,15 +1,18 @@
 {
   "type": "module",
-  "name": "commitai",
+  "name": "@ezo/aicommits",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1",
     "watch": "tsc --watch"
   },
+  "files":
+    ["dist", "README.md", "LICENSE"]
+  ,
   "bin": {
     "aicommits": "dist/cli.js"
   },
