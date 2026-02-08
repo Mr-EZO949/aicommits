@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import "dotenv/config";
 
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
+import { createInterface } from "node:readline/promises";
 import { groqProvider } from "./providers/groq.js";
 
 
@@ -295,6 +296,55 @@ function buildRetryPayload(basePayload: string, firstOutput: string, reason: str
   ].join("\n");
 }
 
+async function promptForCommitConfirmation(message: string): Promise<boolean> {
+  console.log("✅ Proposed commit message:");
+  console.log(message);
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    let settled = false;
+    const answer = await new Promise<string>((resolve) => {
+      const settle = (value: string) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(value);
+      };
+
+      rl.on("SIGINT", () => settle(""));
+      rl.on("close", () => settle(""));
+
+      rl.question("\nCommit with this message? (y/N): ")
+        .then((value) => settle(value))
+        .catch(() => settle(""));
+    });
+
+    const normalized = answer.trim().toLowerCase();
+    return normalized === "y" || normalized === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+function commitWithMessage(message: string): void {
+  const result = spawnSync("git", ["commit", "-m", message], {
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if ((result.status ?? 1) !== 0) {
+    throw new Error(`git commit failed with exit code ${result.status ?? 1}`);
+  }
+}
+
 async function main() {
   if (!isGitRepo()) {
     console.error("❌ Not a git repository. Run this inside a repo.");
@@ -325,45 +375,64 @@ async function main() {
 
   const includedFiles = stagedFiles.filter((f) => !isExcludedFromLLM(f.path));
   const hasLockfile = stagedFiles.some((f) => isLockfile(f.path));
+  let finalMessage = "";
+
   if (includedFiles.length === 0 && hasLockfile) {
-    console.log("✅ Suggested commit message:");
-    console.log("chore(deps): update lockfile");
+    finalMessage = "chore(deps): update lockfile";
+  } else {
+    const llmPayload = buildLLMPayload(stagedFiles, rawDiffUnified0);
+    const truncation = truncateForLLM(llmPayload);
+    const warnings = [...collectNoiseWarnings(rawDiffUnified0), ...truncation.warnings];
+    const truncatedPayload = truncation.text;
+
+    for (const w of warnings) {
+      console.log(w);
+    }
+
+    console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
+
+    try {
+      const firstAttempt = await groqProvider.generateCommitMessage(truncatedPayload);
+      const firstValidation = validateCommitMessage(firstAttempt);
+
+      let msg = firstAttempt.trim();
+      if (!firstValidation.valid) {
+        const retryPayload = buildRetryPayload(truncatedPayload, firstAttempt, firstValidation.reason);
+        const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
+        const secondValidation = validateCommitMessage(secondAttempt);
+
+        if (secondValidation.valid) {
+          msg = secondAttempt.trim();
+        } else {
+          msg = SAFE_FALLBACK_MESSAGE;
+          console.log(
+            `⚠️ Provider returned invalid commit messages twice (${firstValidation.reason}; ${secondValidation.reason}). Using fallback.`
+          );
+        }
+      }
+
+      finalMessage = msg;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`❌ ${msg}`);
+      process.exit(1);
+    }
+  }
+
+  const finalValidation = validateCommitMessage(finalMessage);
+  if (!finalValidation.valid) {
+    finalMessage = SAFE_FALLBACK_MESSAGE;
+    console.log(`⚠️ Final message failed validation (${finalValidation.reason}). Using fallback.`);
+  }
+
+  const shouldCommit = await promptForCommitConfirmation(finalMessage);
+  if (!shouldCommit) {
+    console.log("🟡 Commit cancelled. No changes were committed.");
     process.exit(0);
   }
 
-  const llmPayload = buildLLMPayload(stagedFiles, rawDiffUnified0);
-  const truncation = truncateForLLM(llmPayload);
-  const warnings = [...collectNoiseWarnings(rawDiffUnified0), ...truncation.warnings];
-  const truncatedPayload = truncation.text;
-
-  for (const w of warnings) {
-    console.log(w);
-  }
-
-  console.log(`ℹ️ Using payload size: ${truncatedPayload.length.toLocaleString()} chars\n`);
-
   try {
-    const firstAttempt = await groqProvider.generateCommitMessage(truncatedPayload);
-    const firstValidation = validateCommitMessage(firstAttempt);
-
-    let msg = firstAttempt.trim();
-    if (!firstValidation.valid) {
-      const retryPayload = buildRetryPayload(truncatedPayload, firstAttempt, firstValidation.reason);
-      const secondAttempt = await groqProvider.generateCommitMessage(retryPayload);
-      const secondValidation = validateCommitMessage(secondAttempt);
-
-      if (secondValidation.valid) {
-        msg = secondAttempt.trim();
-      } else {
-        msg = SAFE_FALLBACK_MESSAGE;
-        console.log(
-          `⚠️ Provider returned invalid commit messages twice (${firstValidation.reason}; ${secondValidation.reason}). Using fallback.`
-        );
-      }
-    }
-
-    console.log("✅ Suggested commit message:");
-    console.log(msg);
+    commitWithMessage(finalMessage);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`❌ ${msg}`);
