@@ -93,6 +93,10 @@ function isExcludedFromLLM(path: string): boolean {
     return true;
   }
 
+  if (normalized === "node_modules" || normalized.includes("/node_modules/")) {
+    return true;
+  }
+
   if (normalized.endsWith(".map")) {
     return true;
   }
@@ -143,7 +147,7 @@ function collectNoiseWarnings(rawDiff: string): string[] {
 
   // Optional “noise” warnings (we don't remove yet; just warn).
   const noisyPathHints: Array<{ label: string; re: RegExp }> = [
-    { label: "node_modules/", re: /diff --git a\/node_modules\// },
+    { label: "node_modules/", re: /diff --git a\/(?:.+\/)?node_modules\// },
     { label: "dist/ or build output", re: /diff --git a\/(?:dist|build)\// },
     { label: "coverage/", re: /diff --git a\/coverage\// },
     { label: "lockfile", re: /diff --git a\/(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml)/ },

@@ -24,14 +24,32 @@ export const groqProvider: Provider = {
       messages: [
         {
           role: "system",
-          content:
-            "You write concise git commit messages. Return ONLY one commit message line. Use Conventional Commits format.",
+          content: [
+            "You are a git commit message generator.",
+            "Return ONLY a single commit message line.",
+            "No quotes, no markdown, no code fences, no extra lines.",
+            "Use Conventional Commits: type(scope?): subject",
+            "Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, revert.",
+            "Subject rules: present tense, start lowercase, <= 72 chars, no trailing period.",
+            "Use scope only if it clearly helps (e.g. providers, cli, groq).",
+          ].join(" "),
         },
         {
           role: "user",
-          content: "Generate a commit message for the following staged diff:\n\n" + diff,
+          content: [
+            "Generate the best commit message for the staged changes below.",
+            "The input has two parts:",
+            "1) STAGED FILES (always complete, may include excluded files)",
+            "2) FILTERED DIFF (only included files, unified=0).",
+            "Use STAGED FILES to understand what changed even if diff content is small.",
+            "Do NOT mention excluded files unless they are the only meaningful change.",
+            "",
+            "INPUT:",
+            diff, // this is your M3.5 payload string
+          ].join("\n"),
         },
       ],
+
       temperature: 0.2,
       max_tokens: 80,
     });
