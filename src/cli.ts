@@ -37,12 +37,14 @@ type CliOptions = {
   includeLockfiles: boolean;
   excludeGlobs: string[];
   debugPayload: boolean;
+  copy: boolean;
+  dryRun: boolean;
 };
 
 function printHelp(): void {
   console.log([
     "Usage:",
-    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--help]",
+    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--copy] [--dry-run] [--help]",
     "",
     "Options:",
     "  --custom <text>   Add optional commit style preferences (max 1000 chars).",
@@ -52,6 +54,8 @@ function printHelp(): void {
     "  --exclude <glob>  Exclude staged paths from AI input (repeatable).",
     "                    Examples: --exclude \"dist/**\" --exclude \"*.map\"",
     "  --debug-payload   Print exact payload text sent to the provider.",
+    "  --copy            Copy final validated message to clipboard, then exit.",
+    "  --dry-run         Print final validated message and exit (no prompt, no commit).",
     "  --help, -h        Show this help message.",
     "",
     "Examples:",
@@ -61,6 +65,8 @@ function printHelp(): void {
     "  aicommits --include-lockfiles",
     "  aicommits --exclude \"dist/**\" --exclude \"*.map\"",
     "  aicommits --debug-payload",
+    "  aicommits --copy",
+    "  aicommits --dry-run",
   ].join("\n"));
 }
 
@@ -70,6 +76,8 @@ function parseCliOptions(argv: string[]): CliOptions {
     includeLockfiles: false,
     excludeGlobs: [],
     debugPayload: false,
+    copy: false,
+    dryRun: false,
   };
   let sawCustom = false;
 
@@ -91,6 +99,16 @@ function parseCliOptions(argv: string[]): CliOptions {
 
     if (arg === "--debug-payload") {
       parsed.debugPayload = true;
+      continue;
+    }
+
+    if (arg === "--copy") {
+      parsed.copy = true;
+      continue;
+    }
+
+    if (arg === "--dry-run") {
+      parsed.dryRun = true;
       continue;
     }
 
@@ -685,6 +703,35 @@ function printDebugPayload(payload: string, label: string): void {
   console.log(`🔎 DEBUG PAYLOAD (${label}) END\n`);
 }
 
+function copyToClipboard(text: string): void {
+  const attempts: Array<{ cmd: string; args: string[] }> = [];
+
+  if (process.platform === "darwin") {
+    attempts.push({ cmd: "pbcopy", args: [] });
+  } else if (process.platform === "win32") {
+    attempts.push({ cmd: "clip", args: [] });
+  } else {
+    attempts.push({ cmd: "wl-copy", args: [] });
+    attempts.push({ cmd: "xclip", args: ["-selection", "clipboard"] });
+    attempts.push({ cmd: "xsel", args: ["--clipboard", "--input"] });
+  }
+
+  let lastError = "no clipboard command available";
+  for (const attempt of attempts) {
+    const result = spawnSync(attempt.cmd, attempt.args, {
+      input: text,
+      encoding: "utf8",
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    if (!result.error && (result.status ?? 1) === 0) {
+      return;
+    }
+    lastError = result.error?.message || result.stderr || `exit code ${result.status ?? 1}`;
+  }
+
+  throw new Error(`Failed to copy to clipboard (${lastError.trim()}).`);
+}
+
 type CommitAction = "yes" | "no" | "regenerate";
 
 async function promptForCommitAction(message: string, allowRegenerate: boolean): Promise<CommitAction> {
@@ -955,6 +1002,25 @@ async function main() {
       console.error(`❌ ${msg}`);
       process.exit(1);
     }
+  }
+
+  if (cliOptions.copy || cliOptions.dryRun) {
+    console.log("✅ Final commit message:");
+    console.log(finalMessage);
+
+    if (cliOptions.copy) {
+      try {
+        copyToClipboard(finalMessage);
+        console.log("ℹ️ Copied commit message to clipboard.");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`❌ ${msg}`);
+        process.exit(1);
+      }
+    }
+
+    console.log("🟡 Non-destructive mode enabled. No commit was created.");
+    process.exit(0);
   }
 
   let regenerations = 0;
