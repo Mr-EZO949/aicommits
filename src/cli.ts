@@ -31,6 +31,7 @@ type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
 type ParsedCommitMessage = { type: string; scope?: string; subject: string };
 type FilteringOptions = { includeLockfiles: boolean; excludeGlobs: string[] };
+type SecretExposure = { name: string; file: string; line: number; preview: string };
 type CliOptions = {
   showHelp: boolean;
   customInstructions?: string;
@@ -177,6 +178,102 @@ function parseCliOptions(argv: string[]): CliOptions {
   }
 
   return parsed;
+}
+
+const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  { name: "private key block", re: /BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY/i },
+  { name: "API key assignment", re: /\b(?:export\s+)?[A-Z0-9_]*API[_-]?KEY[A-Z0-9_]*\s*=\s*\S+/ },
+  { name: "password assignment", re: /\bPASS(?:WORD)?\s*=/i },
+  { name: "secret assignment", re: /\bSECRET\s*=/i },
+  { name: "token assignment", re: /\bTOKEN\s*=/i },
+  { name: "sk- token prefix", re: /\bsk-[A-Za-z0-9]{16,}/ },
+];
+
+function detectSecretsInLine(lineContent: string): string[] {
+  const matches: string[] = [];
+  for (const pattern of SECRET_PATTERNS) {
+    if (pattern.re.test(lineContent)) {
+      matches.push(pattern.name);
+    }
+  }
+  return matches;
+}
+
+function summarizePreview(text: string): string {
+  const compact = text.trim().replace(/\s+/g, " ");
+  return compact.length > 80 ? `${compact.slice(0, 77)}...` : compact;
+}
+
+function findSecretExposuresInDiff(rawDiff: string): SecretExposure[] {
+  const exposures: SecretExposure[] = [];
+  const lines = rawDiff.split(/\r?\n/);
+
+  let currentFile = "(unknown)";
+  let inHunk = false;
+  let newLine = 0;
+
+  for (const rawLine of lines) {
+    if (rawLine.startsWith("+++ b/")) {
+      currentFile = rawLine.slice("+++ b/".length).trim() || "(unknown)";
+      continue;
+    }
+
+    if (rawLine.startsWith("@@")) {
+      const match = rawLine.match(/\+(\d+)(?:,\d+)?/);
+      newLine = match ? Number.parseInt(match[1] ?? "0", 10) : 0;
+      inHunk = true;
+      continue;
+    }
+
+    if (!inHunk) {
+      continue;
+    }
+
+    if (rawLine.startsWith("diff --git ")) {
+      inHunk = false;
+      continue;
+    }
+
+    if (rawLine.startsWith("+") && !rawLine.startsWith("+++")) {
+      const content = rawLine.slice(1);
+      const detected = detectSecretsInLine(content);
+      for (const name of detected) {
+        exposures.push({
+          name,
+          file: currentFile,
+          line: newLine,
+          preview: summarizePreview(content),
+        });
+      }
+      newLine += 1;
+      continue;
+    }
+
+    if (rawLine.startsWith(" ") || rawLine === "") {
+      newLine += 1;
+      continue;
+    }
+  }
+
+  return exposures;
+}
+
+function findSecretExposuresInText(input: string, label: string): SecretExposure[] {
+  const exposures: SecretExposure[] = [];
+  const lines = input.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineContent = lines[i] ?? "";
+    const detected = detectSecretsInLine(lineContent);
+    for (const name of detected) {
+      exposures.push({
+        name,
+        file: label,
+        line: i + 1,
+        preview: summarizePreview(lineContent),
+      });
+    }
+  }
+  return exposures;
 }
 
 function getRecentCommitSubjects(limit = STYLE_HISTORY_LIMIT): string[] {
@@ -473,29 +570,22 @@ function printAIInputSummary(stagedFiles: StagedFile[], options: FilteringOption
   }
 }
 
-function assertNoSecrets(rawDiff: string): void {
-  // Very basic “obvious secret” patterns (MVP).
-  // This is NOT perfect security—just a guardrail.
-  const secretPatterns: Array<{ name: string; re: RegExp }> = [
-    { name: "private key block", re: /BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY/i },
-    // Match env-style secret assignments (e.g. GROQ_API_KEY=..., export API_KEY=...)
-    // and avoid false positives like `const apiKey = ...`.
-    { name: "API key assignment", re: /\b(?:export\s+)?[A-Z0-9_]*API[_-]?KEY[A-Z0-9_]*\s*=\s*\S+/ },
-    { name: "password assignment", re: /\bPASS(?:WORD)?\s*=/i },
-    { name: "secret assignment", re: /\bSECRET\s*=/i },
-    { name: "token assignment", re: /\bTOKEN\s*=/i },
-    // common OpenAI-style key prefix (not guaranteed, but good guardrail)
-    { name: "sk- token prefix", re: /\bsk-[A-Za-z0-9]{16,}/ },
-  ];
+function assertNoSecrets(input: string, source: "diff" | "text", label = "input"): void {
+  const exposures = source === "diff"
+    ? findSecretExposuresInDiff(input)
+    : findSecretExposuresInText(input, label);
 
-  for (const p of secretPatterns) {
-    if (p.re.test(rawDiff)) {
-      // Block sending this to any LLM.
-      throw new Error(
-        `Possible sensitive data detected (${p.name}). Refusing to continue. ` +
-          `Unstage/remove secrets and try again.`
-      );
-    }
+  if (exposures.length > 0) {
+    const maxItems = Math.min(5, exposures.length);
+    const formatted = exposures
+      .slice(0, maxItems)
+      .map((item) => `${item.name} at ${item.file}:${item.line} [${item.preview}]`)
+      .join("; ");
+    const suffix = exposures.length > maxItems ? `; +${exposures.length - maxItems} more` : "";
+    throw new Error(
+      `Possible sensitive data detected. ${formatted}${suffix}. ` +
+      "Refusing to continue. Unstage/remove secrets and try again."
+    );
   }
 }
 
@@ -925,7 +1015,7 @@ async function main() {
   const userCustomInstructions = cliOptions.customInstructions;
   if (userCustomInstructions) {
     try {
-      assertNoSecrets(userCustomInstructions);
+      assertNoSecrets(userCustomInstructions, "text", "--custom");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`❌ ${msg}`);
@@ -965,7 +1055,7 @@ async function main() {
   console.log(`ℹ️ Raw diff size (unified=0): ${rawDiffUnified0.length.toLocaleString()} chars`);
 
   try {
-    assertNoSecrets(rawDiffUnified0);
+    assertNoSecrets(rawDiffUnified0, "diff");
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`❌ ${msg}`);
