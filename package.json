@@ -2,32 +2,53 @@
   "type": "module",
   "name": "@mr_ezo/aicommits",
   "version": "1.0.3",
-  "description": "",
+  "description": "Generate Conventional Commit messages from staged git changes.",
   "main": "dist/index.js",
-  "scripts": {
-    "dev": "tsx src/cli.ts",
-    "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "watch": "tsc --watch"
+
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mr-EZO949/aicommits.git"
   },
+  "homepage": "https://github.com/Mr-EZO949/aicommits#readme",
+  "bugs": {
+    "url": "https://github.com/Mr-EZO949/aicommits/issues"
+  },
+
+  "bin": {
+    "aicommits": "dist/cli.js"
+  },
+
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
-  "bin": {
-    "aicommits": "dist/cli.js"
-  },
-  "keywords": [],
-  "author": "",
+
+  "keywords": [
+    "git",
+    "commit",
+    "conventional-commits",
+    "cli",
+    "ai",
+    "groq"
+  ],
+
   "license": "MIT",
+
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+
+  "dependencies": {
+    "dotenv": "^17.2.4",
+    "groq-sdk": "^0.37.0"
+  },
+
   "devDependencies": {
     "@types/node": "^25.2.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
-  },
-  "dependencies": {
-    "dotenv": "^17.2.4",
-    "groq-sdk": "^0.37.0"
   }
 }
