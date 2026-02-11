@@ -1,10 +1,9 @@
 {
   "type": "module",
   "name": "@mr_ezo/aicommits",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Generate Conventional Commit messages from staged git changes.",
   "main": "dist/index.js",
-
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Mr-EZO949/aicommits.git"
@@ -13,17 +12,14 @@
   "bugs": {
     "url": "https://github.com/Mr-EZO949/aicommits/issues"
   },
-
   "bin": {
     "aicommits": "dist/cli.js"
   },
-
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
-
   "keywords": [
     "git",
     "commit",
@@ -32,20 +28,16 @@
     "ai",
     "groq"
   ],
-
   "license": "MIT",
-
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsc",
     "watch": "tsc --watch"
   },
-
   "dependencies": {
     "dotenv": "^17.2.4",
     "groq-sdk": "^0.37.0"
   },
-
   "devDependencies": {
     "@types/node": "^25.2.1",
     "tsx": "^4.21.0",
