@@ -2,7 +2,7 @@
 import "dotenv/config";
 
 import { execSync, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { groqProvider } from "./providers/groq.js";
 
@@ -26,6 +26,7 @@ const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
 const MAX_REGENERATIONS = 3;
 const MAX_REGENERATION_PROVIDER_ATTEMPTS = 3;
 const MAX_CUSTOM_INSTRUCTIONS_CHARS = 1_000;
+const MAX_RULES_CHARS = 2_000;
 const STYLE_HISTORY_LIMIT = 20;
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
@@ -37,6 +38,7 @@ type CliOptions = {
   showHelp: boolean;
   showVersion: boolean;
   customInstructions?: string;
+  rulesUpdate?: string;
   includeLockfiles: boolean;
   excludeGlobs: string[];
   debugPayload: boolean;
@@ -47,9 +49,11 @@ type CliOptions = {
 function printHelp(): void {
   console.log([
     "Usage:",
-    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--copy] [--dry-run] [--version] [--help]",
+    "  aicommits [--rules \"<repo rules>\"] [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--copy] [--dry-run] [--version] [--help]",
     "",
     "Options:",
+    "  --rules <text>    Save persistent commit preferences for this repository.",
+    "                    Stored under .git and reused in future runs.",
     "  --custom <text>   Add optional commit style preferences (max 1000 chars).",
     "                    This is additive and never overrides safety/format rules.",
     "  --include-lockfiles",
@@ -64,6 +68,7 @@ function printHelp(): void {
     "",
     "Examples:",
     "  aicommits",
+    "  aicommits --rules \"prefer scope cli and mention tests when relevant\"",
     "  aicommits --custom \"prefer scope cli and mention tests when relevant\"",
     "  aicommits --custom \"focus on user-facing behavior changes\"",
     "  aicommits --include-lockfiles",
@@ -86,6 +91,7 @@ function parseCliOptions(argv: string[]): CliOptions {
     dryRun: false,
   };
   let sawCustom = false;
+  let sawRules = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -100,6 +106,29 @@ function parseCliOptions(argv: string[]): CliOptions {
 
     if (arg === "--version" || arg === "-v") {
       parsed.showVersion = true;
+      continue;
+    }
+
+    if (arg === "--rules") {
+      if (sawRules) {
+        throw new Error("`--rules` can only be provided once.");
+      }
+      const next = argv[i + 1];
+      if (!next || next === "--help" || next === "-h" || next.startsWith("--")) {
+        throw new Error("Missing value for `--rules`. Example: --rules \"prefer concise subjects\"");
+      }
+      parsed.rulesUpdate = next;
+      sawRules = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--rules=")) {
+      if (sawRules) {
+        throw new Error("`--rules` can only be provided once.");
+      }
+      parsed.rulesUpdate = arg.slice("--rules=".length);
+      sawRules = true;
       continue;
     }
 
@@ -180,6 +209,17 @@ function parseCliOptions(argv: string[]): CliOptions {
     parsed.customInstructions = custom;
   }
 
+  if (parsed.rulesUpdate !== undefined) {
+    const rules = parsed.rulesUpdate.trim();
+    if (rules.length === 0) {
+      throw new Error("`--rules` value cannot be empty.");
+    }
+    if (rules.length > MAX_RULES_CHARS) {
+      throw new Error(`\`--rules\` is too long (${rules.length} chars). Max is ${MAX_RULES_CHARS} chars.`);
+    }
+    parsed.rulesUpdate = rules;
+  }
+
   parsed.excludeGlobs = parsed.excludeGlobs.map((glob) => glob.trim()).filter(Boolean);
   for (const glob of parsed.excludeGlobs) {
     if (glob.length > 512) {
@@ -199,6 +239,25 @@ function getCliVersion(): string {
   } catch {
     return "unknown";
   }
+}
+
+function getRepoRulesPath(): string {
+  return run("git rev-parse --git-path aicommits-rules").trim();
+}
+
+function saveRepoRules(rulesText: string): string {
+  const path = getRepoRulesPath();
+  writeFileSync(path, `${rulesText.trim()}\n`, "utf8");
+  return path;
+}
+
+function loadRepoRules(): string | undefined {
+  const path = getRepoRulesPath();
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  const text = readFileSync(path, "utf8").trim();
+  return text.length > 0 ? text : undefined;
 }
 
 const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
@@ -406,12 +465,23 @@ function inferRepoStyleInstructions(subjects: string[]): string | undefined {
   ].join("\n");
 }
 
-function buildEffectiveCustomInstructions(userCustomInstructions?: string): string | undefined {
-  const styleInstructions = inferRepoStyleInstructions(getRecentCommitSubjects());
-  if (styleInstructions && userCustomInstructions) {
-    return `${styleInstructions}\n\nUser preferences:\n${userCustomInstructions}`;
+function buildEffectiveCustomInstructions(
+  styleInstructions?: string,
+  repoRules?: string,
+  userCustomInstructions?: string
+): string | undefined {
+  const sections: string[] = [];
+  if (styleInstructions) {
+    sections.push(styleInstructions);
   }
-  return styleInstructions || userCustomInstructions;
+  if (repoRules) {
+    sections.push(`Repository saved rules:\n${repoRules}`);
+  }
+  if (userCustomInstructions) {
+    sections.push(`One-time user preferences:\n${userCustomInstructions}`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : undefined;
 }
 
 // Runs a shell command and returns stdout as a string.
@@ -1038,6 +1108,34 @@ async function main() {
     process.exit(0);
   }
 
+  if (!isGitRepo()) {
+    console.error("❌ Not a git repository. Run this inside a repo.");
+    process.exit(1);
+  }
+
+  if (cliOptions.rulesUpdate) {
+    try {
+      assertNoSecrets(cliOptions.rulesUpdate, "text", "--rules");
+      const savedPath = saveRepoRules(cliOptions.rulesUpdate);
+      console.log(`ℹ️ Saved repository rules at: ${savedPath}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`❌ ${msg}`);
+      process.exit(1);
+    }
+  }
+
+  const repoRules = loadRepoRules();
+  if (repoRules) {
+    try {
+      assertNoSecrets(repoRules, "text", "saved-rules");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`❌ ${msg}`);
+      process.exit(1);
+    }
+  }
+
   const userCustomInstructions = cliOptions.customInstructions;
   if (userCustomInstructions) {
     try {
@@ -1048,11 +1146,21 @@ async function main() {
       process.exit(1);
     }
   }
-  const effectiveCustomInstructions = buildEffectiveCustomInstructions(userCustomInstructions);
-  if (effectiveCustomInstructions && !userCustomInstructions) {
+  const inferredStyleInstructions = inferRepoStyleInstructions(getRecentCommitSubjects());
+  const effectiveCustomInstructions = buildEffectiveCustomInstructions(
+    inferredStyleInstructions,
+    repoRules,
+    userCustomInstructions
+  );
+
+  if (repoRules) {
+    console.log("ℹ️ Applying saved repository rules.");
+  }
+
+  if (inferredStyleInstructions && !repoRules && !userCustomInstructions) {
     console.log("ℹ️ Applying inferred repository commit style from recent history.");
-  } else if (effectiveCustomInstructions && userCustomInstructions) {
-    console.log("ℹ️ Applying inferred repository style + your custom instructions.");
+  } else if (inferredStyleInstructions && (repoRules || userCustomInstructions)) {
+    console.log("ℹ️ Applying inferred repository style with your configured preferences.");
   }
 
   const filteringOptions: FilteringOptions = {
@@ -1060,11 +1168,6 @@ async function main() {
     excludeGlobs: cliOptions.excludeGlobs,
   };
   const debugPayload = cliOptions.debugPayload;
-
-  if (!isGitRepo()) {
-    console.error("❌ Not a git repository. Run this inside a repo.");
-    process.exit(1);
-  }
 
   const rawNameStatus = getStagedNameStatus();
   if (!rawNameStatus.trim()) {
