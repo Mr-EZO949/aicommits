@@ -2,6 +2,7 @@
 import "dotenv/config";
 
 import { execSync, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { groqProvider } from "./providers/groq.js";
 
@@ -34,6 +35,7 @@ type FilteringOptions = { includeLockfiles: boolean; excludeGlobs: string[] };
 type SecretExposure = { name: string; file: string; line: number; preview: string };
 type CliOptions = {
   showHelp: boolean;
+  showVersion: boolean;
   customInstructions?: string;
   includeLockfiles: boolean;
   excludeGlobs: string[];
@@ -45,7 +47,7 @@ type CliOptions = {
 function printHelp(): void {
   console.log([
     "Usage:",
-    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--copy] [--dry-run] [--help]",
+    "  aicommits [--custom \"<preferences>\"] [--include-lockfiles] [--exclude <glob>] [--debug-payload] [--copy] [--dry-run] [--version] [--help]",
     "",
     "Options:",
     "  --custom <text>   Add optional commit style preferences (max 1000 chars).",
@@ -57,6 +59,7 @@ function printHelp(): void {
     "  --debug-payload   Print exact payload text sent to the provider.",
     "  --copy            Copy final validated message to clipboard, then exit.",
     "  --dry-run         Print final validated message and exit (no prompt, no commit).",
+    "  --version, -v     Show current CLI version.",
     "  --help, -h        Show this help message.",
     "",
     "Examples:",
@@ -68,12 +71,14 @@ function printHelp(): void {
     "  aicommits --debug-payload",
     "  aicommits --copy",
     "  aicommits --dry-run",
+    "  aicommits --version",
   ].join("\n"));
 }
 
 function parseCliOptions(argv: string[]): CliOptions {
   const parsed: CliOptions = {
     showHelp: false,
+    showVersion: false,
     includeLockfiles: false,
     excludeGlobs: [],
     debugPayload: false,
@@ -90,6 +95,11 @@ function parseCliOptions(argv: string[]): CliOptions {
 
     if (arg === "--help" || arg === "-h") {
       parsed.showHelp = true;
+      continue;
+    }
+
+    if (arg === "--version" || arg === "-v") {
+      parsed.showVersion = true;
       continue;
     }
 
@@ -178,6 +188,17 @@ function parseCliOptions(argv: string[]): CliOptions {
   }
 
   return parsed;
+}
+
+function getCliVersion(): string {
+  try {
+    const packageJsonPath = new URL("../package.json", import.meta.url);
+    const packageJsonRaw = readFileSync(packageJsonPath, "utf8");
+    const parsed = JSON.parse(packageJsonRaw) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
@@ -1009,6 +1030,11 @@ async function main() {
 
   if (cliOptions.showHelp) {
     printHelp();
+    process.exit(0);
+  }
+
+  if (cliOptions.showVersion) {
+    console.log(getCliVersion());
     process.exit(0);
   }
 
