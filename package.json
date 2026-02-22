@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@mr_ezo/aicommits",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Generate Conventional Commit messages from staged git changes.",
   "main": "dist/index.js",
   "repository": {
