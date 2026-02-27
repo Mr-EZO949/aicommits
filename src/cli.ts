@@ -5,6 +5,12 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import {
+  buildPrefix,
+  isSubjectMeaningfullyDifferent,
+  parseCommitMessage,
+  validateCommitMessage,
+} from "./cli/commitMessage.js";
+import {
   getRecentCommitSubjects,
   getStagedDiffUnified0,
   getStagedNameStatus,
@@ -19,18 +25,6 @@ import { groqProvider } from "./providers/groq.js";
 const MAX_CHARS = 25_000;
 const LOCKFILES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]);
 const EXCLUDED_PREFIXES = ["dist/", "build/", "coverage/", "node_modules/"];
-const ALLOWED_COMMIT_TYPES = new Set([
-  "feat",
-  "fix",
-  "docs",
-  "refactor",
-  "perf",
-  "test",
-  "build",
-  "ci",
-  "chore",
-  "revert",
-]);
 const SAFE_FALLBACK_MESSAGE = "chore: update staged changes";
 const MAX_REGENERATIONS = 3;
 const MAX_REGENERATION_PROVIDER_ATTEMPTS = 3;
@@ -38,7 +32,6 @@ const STYLE_HISTORY_LIMIT = 20;
 
 type StagedStatus = "A" | "M" | "D" | "R" | "C";
 type StagedFile = { status: StagedStatus; path: string };
-type ParsedCommitMessage = { type: string; scope?: string; subject: string };
 type FilteringOptions = { includeLockfiles: boolean; excludeGlobs: string[] };
 type SecretExposure = { name: string; file: string; line: number; preview: string };
 function getCliVersion(): string {
@@ -516,102 +509,6 @@ function buildLLMPayload(stagedFiles: StagedFile[], diffUnified0: string, option
     "FILTERED DIFF:",
     filteredDiff || "(all staged file diffs excluded)",
   ].join("\n");
-}
-
-type ValidationResult = { valid: true } | { valid: false; reason: string };
-const CONVENTIONAL_COMMIT_RE = /^([a-z]+)(?:\(([^)]+)\))?: (.+)$/;
-
-function validateCommitMessage(message: string): ValidationResult {
-  const trimmed = message.trim();
-  if (!trimmed) {
-    return { valid: false, reason: "empty message" };
-  }
-
-  if (trimmed.includes("\n") || trimmed.includes("\r")) {
-    return { valid: false, reason: "must be a single line" };
-  }
-
-  if (trimmed.length > 72) {
-    return { valid: false, reason: "must be <= 72 chars" };
-  }
-
-  if (trimmed.endsWith(".")) {
-    return { valid: false, reason: "must not end with a period" };
-  }
-
-  const match = trimmed.match(CONVENTIONAL_COMMIT_RE);
-  if (!match) {
-    return { valid: false, reason: "must match type(scope?): subject" };
-  }
-
-  const type = match[1];
-  const subject = match[3];
-  if (!type || !ALLOWED_COMMIT_TYPES.has(type)) {
-    return { valid: false, reason: "type must be allowed lowercase conventional type" };
-  }
-
-  if (!subject || !subject.trim()) {
-    return { valid: false, reason: "subject must be present" };
-  }
-
-  return { valid: true };
-}
-
-function parseCommitMessage(message: string): ParsedCommitMessage | null {
-  const match = message.trim().match(CONVENTIONAL_COMMIT_RE);
-  if (!match) {
-    return null;
-  }
-  const type = match[1];
-  const scope = match[2];
-  const subject = match[3];
-  if (!type || !subject) {
-    return null;
-  }
-  if (scope) {
-    return { type, scope, subject };
-  }
-  return { type, subject };
-}
-
-function normalizeSubject(subject: string): string {
-  return subject
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isSubjectMeaningfullyDifferent(previousSubject: string, nextSubject: string): boolean {
-  const previous = normalizeSubject(previousSubject);
-  const next = normalizeSubject(nextSubject);
-
-  if (!previous || !next) {
-    return previous !== next;
-  }
-  if (previous === next) {
-    return false;
-  }
-
-  const previousWords = previous.split(" ").filter(Boolean);
-  const nextWords = next.split(" ").filter(Boolean);
-  const previousSet = new Set(previousWords);
-  const nextSet = new Set(nextWords);
-  const allWords = new Set([...previousSet, ...nextSet]);
-
-  let overlap = 0;
-  for (const word of previousSet) {
-    if (nextSet.has(word)) {
-      overlap += 1;
-    }
-  }
-
-  const jaccard = allWords.size === 0 ? 1 : overlap / allWords.size;
-  return jaccard < 0.75;
-}
-
-function buildPrefix(type: string, scope?: string): string {
-  return scope ? `${type}(${scope})` : type;
 }
 
 function buildRetryPayload(basePayload: string, firstOutput: string, reason: string): string {
